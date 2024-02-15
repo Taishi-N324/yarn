@@ -153,7 +153,7 @@ def main(args):
             optim, train_loader, scheduler)
 
     if not args.lora:
-        model.gradient_checkpointing_enable()
+        model.module.gradient_checkpointing_enable()
 
     accelerator.register_for_checkpointing(scheduler)
     total_batch_size = (

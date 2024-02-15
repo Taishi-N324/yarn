@@ -1,7 +1,9 @@
 accelerate
 datasets
 evaluate
-torch>=2
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.1.0+cu118
+torchvision==0.16.0+cu118
 transformers>=4.36.2
 tqdm
 einops
@@ -11,3 +13,6 @@ scikit-learn
 matplotlib
 pandas
 numpy
+deepspeed
+wheel
+wandb
