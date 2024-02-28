@@ -10,7 +10,7 @@ from accelerate.utils import InitProcessGroupKwargs, set_seed, DummyOptim, Dummy
 from tqdm import tqdm
 from transformers import set_seed, default_data_collator, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
-
+import time
 
 def find_all_linear_names(model):
     lora_module_names = set()
@@ -30,23 +30,36 @@ def main(args):
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.wandb:
-        import wandb
-        wandb.login()
-
     set_seed(args.seed)
 
     timeout = InitProcessGroupKwargs(timeout=timedelta(seconds=1_000_000))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulate_every,
         mixed_precision="bf16",
-        log_with="wandb" if args.wandb else None,
+        log_with=None,
         kwargs_handlers=[timeout]
     )
     accelerator.init_trackers(
-        project_name=args.wandb if args.wandb else "yarn",
+        project_name="yarn",
     )
     accelerator.print(f"Total GPUS: {accelerator.num_processes}")
+
+    global_rank = accelerator.state.process_index
+    
+    if args.wandb_name and global_rank == 0:
+        import wandb
+        import datetime
+
+        now = datetime.datetime.now()
+        now = now.strftime("%Y-%m-%d-%H-%M-%S")
+        wandb_setting: dict = {
+            "entity": args.wandb_entity,
+            "project": args.wandb_project,
+            "name": args.wandb_name,
+            "config": vars(args),
+        }
+        wandb.init(**wandb_setting)
+
 
     if args.architecture == "llama":
         from scaled_rope.modeling_llama_yarn import LlamaForCausalLM
@@ -78,12 +91,22 @@ def main(args):
         accelerator.print(
             f"Sliding attention window set to {config.sliding_window}")
 
+
     model = model_cls.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
         config=config,
         use_flash_attention_2=True
     )
+    if global_rank == 0:
+        model_config = {}
+        model_config["activation_function"] = model.config.hidden_act
+        model_config["hidden_size"] = model.config.hidden_size
+        model_config["model_type"] = model.config.model_type
+        model_config["num_attention_heads"] = model.config.num_attention_heads
+        model_config["num_hidden_layers"] = model.config.num_hidden_layers
+        model_config["model_architecture"] = model.config.architectures[0]
+        wandb.config.update(model_config)
 
     try:
         train_dataset = load_dataset(args.dataset)
@@ -187,47 +210,91 @@ def main(args):
         accelerator.print(f"Resuming training from step {resume_step}")
 
     loss_file = open(args.log_loss, "a" if args.resume_from_checkpoint else "w") if args.log_loss and accelerator.is_main_process else None
-
+    
     if not args.save_only:
         model.train()
         for step, batch in enumerate(train_loader):
+            if global_rank == 0:
+                if step % args.gradient_accumulate_every == 0:
+                    iteration_start_time = time.perf_counter() 
+                wandb_stats = {}
+                sequence_length = batch["input_ids"].shape[1]
+                wandb_stats["utils/seq_len"] = sequence_length
+                wandb_stats["utils/batch_size"] = args.batch_size
+                wandb_stats["utils/global_batch_size"] = total_batch_size
+                wandb_stats["utils/gradient_accumulation_steps"] = args.gradient_accumulate_every
             if sliding_window_attention_schedule is not None:
                 model.config.sliding_window = sliding_window_attention_schedule[completed_steps % len(
                     sliding_window_attention_schedule)]
 
             loss_log = None
             with accelerator.accumulate(model):
-                loss = model(**batch).loss
+                outputs = model(**batch)
+                loss = outputs.loss / args.gradient_accumulate_every 
                 accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    loss_log = {"loss": loss.item()}
-                    accelerator.log(loss_log, step=completed_steps)
-                    if loss_file is not None:
-                        loss_file.write(f"{loss_log['loss']},")
-                        loss_file.flush()
+                if (step + 1) % args.gradient_accumulate_every == 0:
+                    optim.step()
+                    scheduler.step()
+                    optim.zero_grad()
+                    completed_steps += 1
+
                     if isinstance(args.grad_norm, float):
                         accelerator.clip_grad_norm_(
-                            model.parameters(), args.grad_norm)
+                        model.parameters(), args.grad_norm)
 
-                optim.step()
-                scheduler.step()
-                optim.zero_grad()
+                    if global_rank == 0:
+                        iteration_end_time = time.perf_counter()
+                        iteration_time = iteration_end_time - iteration_start_time
+                        tokens_per_sec = total_batch_size * sequence_length / iteration_time
 
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                if loss_log is not None:
-                    progress_bar.set_postfix(loss_log)
-                completed_steps += 1
+                        checkpoint_activations_factor = 3
+                        num_layers = config.num_hidden_layers
+                        hidden_size = config.hidden_size
+                        vocab_size =  config.vocab_size
+                        activation_func = config.hidden_act
+                        intermediate_size = config.intermediate_size
+                        num_query_groups = config.num_attention_heads / config.num_key_value_heads
+                        batch_size = args.batch_size * args.gradient_accumulate_every
 
-                if isinstance(args.checkpointing_steps, int) and completed_steps > 0:
-                    if completed_steps % args.checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps}"
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(
-                                args.output_dir, output_dir)
+                        activation_function_factor = 4  # GELU
+                        if activation_func == "silu":
+                            activation_function_factor = 4 + 2  # SWiGLU (upscaling + down scaling)
+
+                        flops_per_iteration = checkpoint_activations_factor * ((
+                            (2 + (2 * 3) + activation_function_factor * (intermediate_size / hidden_size)) * batch_size * sequence_length * num_layers * (hidden_size**2)
+                        ) + (
+                            ((  # Attention matrix & attention over values
+                                4 * batch_size * (sequence_length ** 2) * hidden_size
+                            ) / num_query_groups
+                            ) +  # noqa: W504
+                            # lm-head: logit layer
+                            2 * batch_size * sequence_length * hidden_size * vocab_size)
+                        )
+                        tflops = flops_per_iteration / (iteration_time * (10**12))
+
+                        wandb_stats.update({
+                            "training/loss": loss.item() * args.gradient_accumulate_every,  
+                            "stats/1_iteration_time": iteration_time,
+                            "stats/tflops": tflops,
+                            "stats/tokens_per_sec": tokens_per_sec,
+                            "stats/tokens_per_sec_per_gpu": tokens_per_sec / accelerator.num_processes,
+                        })
+                        wandb.log(wandb_stats, step=completed_steps)
+                        print("------------------------------------------------------------------")
+                        print(f"iteration: {iteration_time} , TFLOPS: {tflops}, Tokens per sec: {tokens_per_sec}, Loss: {loss.item() * args.gradient_accumulate_every}")
+                        print(
+                            "------------------------------------------------------------------",
+                            flush=True,
+                        )
+                    
+                    if isinstance(args.checkpointing_steps, int) and completed_steps % args.checkpointing_steps == 0:
+                        output_dir = os.path.join(args.output_dir, f"step_{completed_steps}") if args.output_dir is not None else f"step_{completed_steps}"
                         accelerator.save_state(output_dir)
 
+            progress_bar.update(1)
+            if loss_log is not None:
+                progress_bar.set_postfix(loss=loss.item())
             if completed_steps >= args.max_train_steps:
                 break
 
@@ -265,6 +332,9 @@ if __name__ == "__main__":
     args.add_argument("--checkpointing-steps", type=int)
     args.add_argument("--output-dir", type=str, required=True)
     args.add_argument("--wandb", type=str)
+    args.add_argument("--wandb-entity", type=str, default=None)
+    args.add_argument("--wandb-name", type=str, default=None)
+    args.add_argument("--wandb-project", type=str, default=None)
     args.add_argument("--seed", type=int, default=42)
     args.add_argument("--max-train-steps", type=int, default=400)
     args.add_argument("--warmup-steps", type=int, default=20)
