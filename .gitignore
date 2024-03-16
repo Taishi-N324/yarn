@@ -10,3 +10,5 @@ lm_cache/
 run.sh
 
 helpers.cpython-3*-x86_64-linux-gnu.so
+.python-version
+flash-attention/
