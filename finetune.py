@@ -155,13 +155,13 @@ def main():
         if is_rank_0():
             print(
              f"Sliding attention window set to {config.sliding_window}")
-
-
+    if args.architecture == "mistral":
+        config._flash_attn_2_enabled = True
     model = model_cls.from_pretrained(
         args.base_model,
         torch_dtype=torch.bfloat16,
         config=config,
-        use_flash_attention_2=True
+        attn_implementation="flash_attention_2",
     )
     # dataset
     from src.datasets.pretrain_dataset import build_train_valid_test_datasets
