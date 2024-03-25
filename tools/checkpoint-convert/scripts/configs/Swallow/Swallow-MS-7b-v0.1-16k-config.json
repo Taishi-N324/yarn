@@ -3,6 +3,10 @@
     "architectures": [
       "MistralForCausalLM"
     ],
+    "auto_map": {
+      "AutoConfig": "configuration_mistral.MistralConfig",
+      "AutoModelForCausalLM": "modeling_mistral_yarn.MistralForCausalLM"
+    },
     "attention_dropout": 0.0,
     "bos_token_id": 1,
     "eos_token_id": 2,
