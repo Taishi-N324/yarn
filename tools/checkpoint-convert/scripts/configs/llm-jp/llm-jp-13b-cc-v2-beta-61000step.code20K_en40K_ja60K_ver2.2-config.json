@@ -1,7 +1,6 @@
 {
-    "_name_or_path": "tokyotech-llm/Swallow-13b-hf",
     "architectures": [
-      "LlamaForCausalLM"
+      "LLaMAForCausalLM"
     ],
     "auto_map": {
         "AutoConfig": "configuration_llama.LlamaConfig",
@@ -24,14 +23,15 @@
     "pretraining_tp": 1,
     "rms_norm_eps": 1e-05,
     "rope_scaling": {
-      "factor": 4.0,
-      "original_max_position_embeddings": 4096,
-      "type": "yarn"
+        "factor": 4.0,
+        "original_max_position_embeddings": 4096,
+        "type": "yarn"
     },
     "rope_theta": 10000.0,
     "tie_word_embeddings": false,
     "torch_dtype": "bfloat16",
     "transformers_version": "4.38.2",
     "use_cache": true,
-    "vocab_size": 43176
+    "vocab_size": 97024
   }
+  
